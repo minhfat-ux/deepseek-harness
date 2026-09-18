@@ -184,19 +184,34 @@ async function initializeSecret(credentials: CredentialProvider): Promise<Buffer
  */
 export class BrowserAuth {
   private readonly launchToken: string
-  private readonly maxAgeMilliseconds: number
+  private secret: Buffer
 
   private constructor(
     processOwner: object,
-    private readonly secret: Buffer,
-    maxAgeDays: number,
+    private readonly credentials: CredentialProvider,
+    secret: Buffer,
+    private readonly maxAgeDays: () => number,
   ) {
     this.launchToken = processLaunchToken(processOwner)
-    this.maxAgeMilliseconds = maxAgeDays * DAY_MILLISECONDS
-    if (!Number.isSafeInteger(this.maxAgeMilliseconds)
-      || !Number.isSafeInteger(Date.now() + this.maxAgeMilliseconds)) {
+    this.secret = secret
+    // Fail fast when the configured lifetime cannot be represented.
+    this.maxAgeMilliseconds()
+  }
+
+  /**
+   * Configured browser-cookie lifetime in milliseconds. Re-read on every use so
+   * a settings change reaches newly minted cookies without a restart, and so a
+   * lowered maximum also stops accepting cookies issued under the older one.
+   * @returns the validated lifetime in milliseconds.
+   * @throws {Error} when the configured lifetime exceeds the safe timestamp range.
+   */
+  private maxAgeMilliseconds(): number {
+    const milliseconds = this.maxAgeDays() * DAY_MILLISECONDS
+    if (!Number.isSafeInteger(milliseconds)
+      || !Number.isSafeInteger(Date.now() + milliseconds)) {
       throw new Error('client-connection: cookieMaxAgeDays exceeds the safe timestamp range')
     }
+    return milliseconds
   }
 
   /**
@@ -204,15 +219,26 @@ export class BrowserAuth {
    * when this Harness home has none.
    * @param processOwner - root application context retaining one token across Connection reloads.
    * @param credentials - persistent credential provider for the Web profile.
-   * @param maxAgeDays - positive absolute browser-cookie lifetime in days.
+   * @param maxAgeDays - thunk returning the live cookie lifetime in days.
    * @returns initialized authentication owner with the process owner's launch token.
    */
   static async create(
     processOwner: object,
     credentials: CredentialProvider,
-    maxAgeDays: number,
+    maxAgeDays: () => number,
   ): Promise<BrowserAuth> {
-    return new BrowserAuth(processOwner, await initializeSecret(credentials), maxAgeDays)
+    return new BrowserAuth(processOwner, credentials, await initializeSecret(credentials), maxAgeDays)
+  }
+
+  /**
+   * Replace the durable signing secret so every cookie minted under the
+   * previous one stops authenticating, on this and every other Harness process
+   * sharing the home.
+   * @returns a promise settling after the replacement secret is durable.
+   */
+  async rotateSecret(): Promise<void> {
+    await this.credentials.deleteRecord(AUTH_RECORD_KEY)
+    this.secret = await initializeSecret(this.credentials)
   }
 
   /**
@@ -245,8 +271,9 @@ export class BrowserAuth {
       const authority = requestAuthority(req.headers)
       if (req.method === 'GET' && url.pathname === '/' && tokens.length === 1
         && authority !== undefined && tokenMatches(tokens.join(''), this.launchToken)) {
+        const maxAgeMilliseconds = this.maxAgeMilliseconds()
         const issuedAt = Date.now()
-        const expiresAt = issuedAt + this.maxAgeMilliseconds
+        const expiresAt = issuedAt + maxAgeMilliseconds
         const value = encodeCookie({
           version: COOKIE_PAYLOAD_VERSION,
           authority,
@@ -258,7 +285,7 @@ export class BrowserAuth {
           'location': '/',
           'referrer-policy': 'no-referrer',
           'set-cookie': sessionCookie(
-            cookieName(authority), value, expiresAt, Math.floor(this.maxAgeMilliseconds / 1000),
+            cookieName(authority), value, expiresAt, Math.floor(maxAgeMilliseconds / 1000),
           ),
         })
         res.end()
@@ -298,7 +325,7 @@ export class BrowserAuth {
     return payload.issuedAt <= now
       && payload.expiresAt > now
       && payload.expiresAt > payload.issuedAt
-      && payload.expiresAt - payload.issuedAt <= this.maxAgeMilliseconds
+      && payload.expiresAt - payload.issuedAt <= this.maxAgeMilliseconds()
   }
 
   private writeUnauthorized(req: ConnectionIndexRequest, res: ConnectionIndexResponse): void {

@@ -3,6 +3,8 @@ import type { Context } from '@deepseek-ai/cordis'
 import z from '@deepseek-ai/schemastery'
 import type {} from '@deepseek-ai/dsh-attachment'
 import type {} from '@deepseek-ai/dsh-credentials'
+// Activates the settings Context merge used by the policy section below.
+import type {} from '@deepseek-ai/dsh-settings'
 // Activates the webServer Context merge used below.
 import type { WebRoute } from '@deepseek-ai/dsh-host-webserver'
 import { API_PATH } from './api-path.ts'
@@ -68,6 +70,9 @@ function assertImageBodyCapacity(ctx: Context, maxRequestBodyBytes: number): voi
 /** Services required before providing Connection. */
 export const inject = ['credentials']
 
+/** Settings namespace owning the live browser-transport policy. */
+export const CONNECTION_SETTINGS_NAMESPACE = 'connection'
+
 /** Browser authentication, request limits, and connection recovery configuration. */
 export interface ConnectionConfig {
   /** Browser recovery timing, injected into each served page. */
@@ -85,6 +90,12 @@ export interface ConnectionConfig {
   cookieMaxAgeDays?: number
   /** Maximum buffered JSON body for every `/api` request. Default: 300 MiB. */
   maxRequestBodyBytes?: number
+  /**
+   * Set true to replace the durable browser-session signing secret, which
+   * invalidates every existing cookie on every browser sharing this Harness
+   * home. The owner honors the request and clears it back to false.
+   */
+  revokeBrowserSessions?: boolean
 }
 
 export const Config: z<ConnectionConfig> = z.object({
@@ -92,34 +103,61 @@ export const Config: z<ConnectionConfig> = z.object({
   trustedHosts: z.array(String).default([]),
   cookieMaxAgeDays: z.natural().min(1).default(30),
   maxRequestBodyBytes: z.natural().min(1).default(DEFAULT_MAX_REQUEST_BODY_BYTES),
+  revokeBrowserSessions: z.boolean().default(false),
 })
+
+/** Connection policy with schema defaults applied, re-derived whenever the source changes. */
+interface ConnectionValues {
+  recovery: ConnectionRecoveryConfig
+  trustedHosts: readonly string[]
+  cookieMaxAgeDays: number
+  maxRequestBodyBytes: number
+  revokeBrowserSessions: boolean
+}
+
+/**
+ * Apply the schema defaults to one configuration value. The Loader resolves
+ * defaults for a composed entry; a hand-built context, or a settings section
+ * read before the provider attached, may still omit fields.
+ * @param config - the configuration value to complete.
+ * @returns the complete policy.
+ */
+function resolveConnectionValues(config: ConnectionConfig | undefined): ConnectionValues {
+  return {
+    recovery: resolveConnectionConfig(config?.recovery),
+    trustedHosts: config?.trustedHosts ?? [],
+    cookieMaxAgeDays: config?.cookieMaxAgeDays ?? 30,
+    maxRequestBodyBytes: config?.maxRequestBodyBytes ?? DEFAULT_MAX_REQUEST_BODY_BYTES,
+    revokeBrowserSessions: config?.revokeBrowserSessions ?? false,
+  }
+}
 
 /**
  * Provides carrier-neutral RPC and Fetch registries. When `webServer` is
  * present, the plugin also mounts the `/api` browser transport with Host/Origin
  * checks and persistent browser authentication.
+ *
+ * Every policy field is read through a live thunk, so a committed settings
+ * change reaches the trust fence, the cookie lifetime, the request-body limit,
+ * and the injected recovery timing without a restart.
  * @param ctx - Host plugin context.
  * @param config - resolved plugin config (schema defaults applied).
  */
 export async function apply(ctx: Context, config?: ConnectionConfig): Promise<void> {
-  const recovery = resolveConnectionConfig(config?.recovery)
-  // The Loader resolves schema defaults; hand-built test contexts may pass none.
-  const trustedHosts = config?.trustedHosts ?? []
-  const cookieMaxAgeDays = config?.cookieMaxAgeDays ?? 30
-  const maxRequestBodyBytes = config?.maxRequestBodyBytes ?? DEFAULT_MAX_REQUEST_BODY_BYTES
+  // Composition config until a settings provider attaches its own source.
+  let current: () => ConnectionConfig = () => config ?? {}
+  const values = (): ConnectionValues => resolveConnectionValues(current())
+
   // Config boundary: a malformed entry fails the load loudly here rather than
   // silently authorizing its hostname prefix at request time.
-  for (const entry of trustedHosts) assertTrustedAuthority(entry)
-  assertImageBodyCapacity(ctx, maxRequestBodyBytes)
-  const connection = new HostConnectionService(
-    ctx,
-    trustedHosts,
-    await BrowserAuth.create(ctx.root, ctx.credentials, cookieMaxAgeDays),
-  )
+  for (const entry of values().trustedHosts) assertTrustedAuthority(entry)
+  assertImageBodyCapacity(ctx, values().maxRequestBodyBytes)
+  const auth = await BrowserAuth.create(ctx.root, ctx.credentials, () => values().cookieMaxAgeDays)
+  const connection = new HostConnectionService(ctx, () => values().trustedHosts, auth)
   ctx.inject(['webServer'], (webCtx) => {
-    assertImageBodyCapacity(webCtx, maxRequestBodyBytes)
+    assertImageBodyCapacity(webCtx, values().maxRequestBodyBytes)
     webCtx.on('webserver/index-inject', (table) => {
-      table.push({ kind: 'global', name: '__DSH_CONNECTION_RECOVERY__', value: recovery })
+      table.push({ kind: 'global', name: '__DSH_CONNECTION_RECOVERY__', value: values().recovery })
     })
     const fetchHandler = connection.createSharedFetchHandler(API_PATH)
     const route: WebRoute = {
@@ -132,12 +170,42 @@ export async function apply(ctx: Context, config?: ConnectionConfig): Promise<vo
           res.end(rejection === 401 ? 'unauthorized' : 'forbidden')
           return
         }
-        await bridge(req, res, fetchHandler, maxRequestBodyBytes)
+        await bridge(req, res, fetchHandler, values().maxRequestBodyBytes)
       },
     }
     webCtx.effect(() => webCtx.webServer.register(route), 'client-connection: /api route')
   })
   ctx.inject(['attachments'], (attachmentCtx) => {
-    assertImageBodyCapacity(attachmentCtx, maxRequestBodyBytes)
+    assertImageBodyCapacity(attachmentCtx, values().maxRequestBodyBytes)
+  })
+  ctx.inject(['settings'], (settingsCtx) => {
+    const settings = settingsCtx.settings
+    // A revoke request may arrive from the settings document while this process
+    // is running, or be left pending by a write made while it was stopped.
+    // Honoring it clears the flag, so the request is idempotent either way.
+    let revoking = false
+    const honorRevoke = async (): Promise<void> => {
+      if (revoking || !values().revokeBrowserSessions) return
+      revoking = true
+      try {
+        await auth.rotateSecret()
+        await settings.update(CONNECTION_SETTINGS_NAMESPACE, { revokeBrowserSessions: false })
+      } finally {
+        revoking = false
+      }
+    }
+    settings.installSection(ctx, CONNECTION_SETTINGS_NAMESPACE, Config, config ?? {}, {
+      setSource: (source) => { current = source },
+      onChange: () => {
+        const live = values()
+        for (const entry of live.trustedHosts) assertTrustedAuthority(entry)
+        assertImageBodyCapacity(ctx, live.maxRequestBodyBytes)
+        void honorRevoke()
+      },
+      validate: (value) => {
+        for (const entry of value.trustedHosts ?? []) assertTrustedAuthority(entry)
+        assertImageBodyCapacity(ctx, value.maxRequestBodyBytes ?? DEFAULT_MAX_REQUEST_BODY_BYTES)
+      },
+    })
   })
 }
