@@ -506,7 +506,7 @@ export function spawnInheritedJobProcess(
       api,
       options,
       commandLine,
-      abi.CREATE_SUSPENDED,
+      abi.CREATE_SUSPENDED | abi.CREATE_NO_WINDOW,
       startupInfo,
       processInfo,
     ))
@@ -531,7 +531,7 @@ export function spawnCurrentTokenJobProcess(
       null,
       null,
       1,
-      abi.CREATE_SUSPENDED | abi.CREATE_UNICODE_ENVIRONMENT,
+      abi.CREATE_SUSPENDED | abi.CREATE_UNICODE_ENVIRONMENT | abi.CREATE_NO_WINDOW,
       environment,
       options.cwd,
       startupInfo,

@@ -139,6 +139,9 @@ export function launchWindowsJob(
       cwd: process.cwd(),
       env: runnerEnvironment(WINDOWS_RUNNER_SELECTION, invocation),
       stdio: runnerStdio(spec, true, ignoredStdinFd ?? 'pipe'),
+      // The runner is a console application. Without this, a host that owns no
+      // console of its own (an editor or GUI launcher) gives it a new window.
+      windowsHide: true,
     }) as RunnerProcess
   } finally {
     if (ignoredStdinFd !== undefined) closeSync(ignoredStdinFd)

@@ -12,6 +12,13 @@ export const WAIT_TIMEOUT = 258
 export const CREATE_SUSPENDED = 0x4
 /** CreateProcess flag selecting a UTF-16 environment block. */
 export const CREATE_UNICODE_ENVIRONMENT = 0x400
+/**
+ * CreateProcess flag that gives the child no console at all. A console
+ * application spawned without it gets a fresh console window whenever the
+ * parent owns none — which is the case for a GUI or editor host — so every
+ * tool call would flash a window.
+ */
+export const CREATE_NO_WINDOW = 0x08000000
 /** GetStdHandle selector for standard input. */
 export const STD_INPUT_HANDLE = -10
 /** GetStdHandle selector for standard output. */
