@@ -178,6 +178,9 @@ function spawnBrowserLauncher(url: string): ChildProcess {
   ], {
     env: scrubbedParentEnv(),
     stdio: ['ignore', 'inherit', 'pipe'],
+    // The opener is a console Node process. Without this, a host that owns no
+    // console window (a GUI or editor launch) gets a new window for it.
+    windowsHide: true,
   })
 }
 
