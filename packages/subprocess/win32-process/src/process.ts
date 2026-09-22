@@ -233,7 +233,7 @@ export function spawnPipedProcess(
       api,
       options,
       buildCommandLine(options.command, options.args),
-      0,
+      abi.CREATE_NO_WINDOW,
       startupInfo,
       processInfo,
     )
